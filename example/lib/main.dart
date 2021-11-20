@@ -24,7 +24,7 @@ class _MyAppState extends State<MyApp> {
 
   List<Map<dynamic, dynamic>>? _classificationResult;
 
-  final String _imgPath = "assets/images/asana_1.jpeg";
+  final String _imgPath = "assets/images/asana_2.jpeg";
   final String _labelPath = "assets/ml/class_labels.txt";
 
   String? _modelPath;

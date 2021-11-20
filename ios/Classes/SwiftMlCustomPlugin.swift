@@ -81,63 +81,24 @@ public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
     }
     
      public func runModelOnImage(call: FlutterMethodCall, result: @escaping FlutterResult) {
+         
+         
          let arguments = call.arguments as! NSDictionary
          let modelPath = arguments["modelPath"] as! String
          let imgBytes = arguments["imgFileBytes"] as! FlutterStandardTypedData
          
-         let uiImage = UIImage(data: imgBytes.data)
-//         let image = uiImage?.cgImage
+         let uiImage = UIImage(data: imgBytes.data, scale: 1.0)
          
          
          
-//         guard let context = CGContext(
-//           data: nil,
-//           width: image!.width, height: image!.height,
-//           bitsPerComponent: 8, bytesPerRow: image!.width * 4,
-//           space: CGColorSpaceCreateDeviceRGB(),
-//           bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-//         ) else {
-//           return
-//         }
-//
-//         context.draw(image!, in: CGRect(x: 0, y: 0, width: image!.width, height: image!.height))
-//         guard let imageData = context.data else { return }
-
          let inputData = uiImage?.jpegData(compressionQuality: 1.0)
          
-//        for row in 0 ..< 224 {
-//            for col in 0 ..< 224 {
-//                let offset = 4 * (row * context.width + col)
-//                // (Ignore offset 0, the unused alpha channel)
-//                let red = imageData.load(fromByteOffset: offset+1, as: UInt8.self)
-//                let green = imageData.load(fromByteOffset: offset+2, as: UInt8.self)
-//                let blue = imageData.load(fromByteOffset: offset+3, as: UInt8.self)
-//
-//                // Normalize channel values to [0.0, 1.0]. This requirement varies
-//                // by model. For example, some models might require values to be
-//                // normalized to the range [-1.0, 1.0] instead, and others might
-//                // require fixed-point values or the original bytes.
-//                var normalizedRed = Float32(red) / 255.0
-//                var normalizedGreen = Float32(green) / 255.0
-//                var normalizedBlue = Float32(blue) / 255.0
-//
-//                // Append normalized values to Data object in RGB order.
-//                let elementSize = MemoryLayout.size(ofValue: normalizedRed)
-//                var bytes = [UInt8](repeating: 0, count: elementSize)
-//                memcpy(&bytes, &normalizedRed, elementSize)
-//                inputData.append(&bytes, count: elementSize)
-//                memcpy(&bytes, &normalizedGreen, elementSize)
-//                inputData.append(&bytes, count: elementSize)
-//                memcpy(&bytes, &normalizedBlue, elementSize)
-//                inputData.append(&bytes, count: elementSize)
-//            }
-//       }
-//
-         NSLog(inputData?.base64EncodedString() ?? "")
          
-         let interpreter = try? Interpreter(modelPath: modelPath)
+         var option = Interpreter.Options()
+         option.threadCount = 1
+//         option.isXNNPackEnabled = true
          
-         NSLog("TFLite Desc: " + interpreter.debugDescription)
+         let interpreter = try? Interpreter(modelPath: modelPath, options: option)
          
          try? interpreter?.allocateTensors()
          let _ = try? interpreter?.copy(inputData!, toInputAt: 0)
@@ -145,37 +106,53 @@ public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
          
          let output = try? interpreter?.output(at: 0)
          
-//         print(output)
+         print(output?.data ?? "")
          
          let outputDim = output?.shape.dimensions
-         
-//         print(outputDim?[0] ?? "NULL")
-         
-         
-//
+  
          let probabilities =
          UnsafeMutableBufferPointer<Float32>.allocate(capacity: outputDim?[1] ?? 0)
         
-//         print(probabilities.count)
-         
          let _ = output?.data.copyBytes(to: probabilities)
          
          var outputArray: Array = Array(repeating: Float32(0), count: 0)
         
-//         print(outputArray.count)
+         
          for prob in probabilities {
              outputArray.append(prob)
          }
          
-//         interpreter.
-         
-//          print(outputArray.count)
-         
          result(outputArray)
          
-
-         
      }
+    
+    func buffer(from image: UIImage) -> CVPixelBuffer? {
+      let attrs = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue] as CFDictionary
+      var pixelBuffer : CVPixelBuffer?
+      let status = CVPixelBufferCreate(kCFAllocatorDefault, Int(image.size.width), Int(image.size.height), kCVPixelFormatType_32ARGB, attrs, &pixelBuffer)
+      guard (status == kCVReturnSuccess) else {
+        return nil
+      }
+
+      CVPixelBufferLockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+      let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer!)
+
+      let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+      let context = CGContext(data: pixelData, width: Int(image.size.width), height: Int(image.size.height), bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer!), space: rgbColorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+
+      context?.translateBy(x: 0, y: image.size.height)
+      context?.scaleBy(x: 1.0, y: -1.0)
+
+      UIGraphicsPushContext(context!)
+      image.draw(in: CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height))
+      UIGraphicsPopContext()
+      CVPixelBufferUnlockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+
+      return pixelBuffer
+    }
+    
+    
+    
 }
 
 
