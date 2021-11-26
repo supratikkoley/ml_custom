@@ -160,7 +160,7 @@ public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
                return
              }
 
-             print(results)
+//             print(results)
              result(results)
 
              
