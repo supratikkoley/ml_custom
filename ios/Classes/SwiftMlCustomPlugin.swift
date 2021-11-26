@@ -3,6 +3,9 @@ import UIKit
 import ImageIO
 import FirebaseMLModelDownloader
 import TensorFlowLite
+import CoreImage
+import Accelerate
+
 
 public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
   public static func register(with registrar: FlutterPluginRegistrar) {
@@ -81,17 +84,27 @@ public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
     }
     
      public func runModelOnImage(call: FlutterMethodCall, result: @escaping FlutterResult) {
-         
+         let batchSize = 1
+         let inputChannels = 3
+         let inputWidth = 224
+         let inputHeight = 224
+
          
          let arguments = call.arguments as! NSDictionary
          let modelPath = arguments["modelPath"] as! String
          let imgBytes = arguments["imgFileBytes"] as! FlutterStandardTypedData
          
-         let uiImage = UIImage(data: imgBytes.data, scale: 1.0)
+         var uiImage = UIImage(data: imgBytes.data)
+//         let image = uiImage?.cgImage
          
+         let scaledSize = CGSize(width: inputWidth, height: inputHeight)
+         if #available(iOS 15.0, *) {
+             uiImage = uiImage?.preparingThumbnail(of: scaledSize)
+         } else {
+             // Fallback on earlier versions
+         }
          
-         
-         let inputData = uiImage?.jpegData(compressionQuality: 1.0)
+         let pixelBuffer = uiImage?.convertToBuffer()
          
          
          var option = Interpreter.Options()
@@ -99,60 +112,218 @@ public class SwiftMlCustomPlugin: NSObject, FlutterPlugin {
 //         option.isXNNPackEnabled = true
          
          let interpreter = try? Interpreter(modelPath: modelPath, options: option)
-         
          try? interpreter?.allocateTensors()
-         let _ = try? interpreter?.copy(inputData!, toInputAt: 0)
-         try? interpreter?.invoke()
          
-         let output = try? interpreter?.output(at: 0)
-         
-         print(output?.data ?? "")
-         
-         let outputDim = output?.shape.dimensions
-  
-         let probabilities =
-         UnsafeMutableBufferPointer<Float32>.allocate(capacity: outputDim?[1] ?? 0)
-        
-         let _ = output?.data.copyBytes(to: probabilities)
-         
-         var outputArray: Array = Array(repeating: Float32(0), count: 0)
-        
-         
-         for prob in probabilities {
-             outputArray.append(prob)
+         let outputTensor: Tensor
+         do {
+           // Allocate memory for the model's input `Tensor`s.
+           try interpreter?.allocateTensors()
+           let inputTensor = try interpreter?.input(at: 0)
+
+           // Remove the alpha component from the image buffer to get the RGB data.
+           guard let rgbData = rgbDataFromBuffer(
+             pixelBuffer!,
+             byteCount: batchSize * inputWidth * inputHeight * inputChannels,
+             isModelQuantized: inputTensor?.dataType == .uInt8
+           ) else {
+             print("Failed to convert the image buffer to RGB data.")
+             return
+           }
+
+           // Copy the RGB data to the input `Tensor`.
+           try interpreter?.copy(rgbData, toInputAt: 0)
+
+           // Run inference by invoking the `Interpreter`.
+           try interpreter?.invoke()
+
+           // Get the output `Tensor` to process the inference results.
+           outputTensor = try interpreter!.output(at: 0)
+//           print(outputTensor.shape)
+             
+             
+           
+             let results: [Float]
+             switch outputTensor.dataType {
+             case .uInt8:
+               guard let quantization = outputTensor.quantizationParameters else {
+                 print("No results returned because the quantization values for the output tensor are nil.")
+                 return
+               }
+               let quantizedResults = [UInt8](outputTensor.data)
+               results = quantizedResults.map {
+                 quantization.scale * Float(Int($0) - quantization.zeroPoint)
+               }
+             case .float32:
+               results = [Float32](unsafeData: outputTensor.data) ?? []
+             default:
+               print("Output tensor data type \(outputTensor.dataType) is unsupported for this example app.")
+               return
+             }
+
+             print(results)
+             result(results)
+
+             
+         } catch let error {
+           print("Failed to invoke the interpreter with error: \(error.localizedDescription)")
+           return
          }
+
          
-         result(outputArray)
          
      }
     
-    func buffer(from image: UIImage) -> CVPixelBuffer? {
-      let attrs = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue] as CFDictionary
-      var pixelBuffer : CVPixelBuffer?
-      let status = CVPixelBufferCreate(kCFAllocatorDefault, Int(image.size.width), Int(image.size.height), kCVPixelFormatType_32ARGB, attrs, &pixelBuffer)
-      guard (status == kCVReturnSuccess) else {
-        return nil
+    private func rgbDataFromBuffer(
+        _ buffer: CVPixelBuffer,
+        byteCount: Int,
+        isModelQuantized: Bool
+      ) -> Data? {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer {
+          CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+        }
+        guard let sourceData = CVPixelBufferGetBaseAddress(buffer) else {
+          return nil
+        }
+        
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let destinationChannelCount = 3
+        let destinationBytesPerRow = destinationChannelCount * width
+        
+        var sourceBuffer = vImage_Buffer(data: sourceData,
+                                         height: vImagePixelCount(height),
+                                         width: vImagePixelCount(width),
+                                         rowBytes: sourceBytesPerRow)
+        
+        guard let destinationData = malloc(height * destinationBytesPerRow) else {
+          print("Error: out of memory")
+          return nil
+        }
+        
+        defer {
+            free(destinationData)
+        }
+
+        var destinationBuffer = vImage_Buffer(data: destinationData,
+                                              height: vImagePixelCount(height),
+                                              width: vImagePixelCount(width),
+                                              rowBytes: destinationBytesPerRow)
+
+        let pixelBufferFormat = CVPixelBufferGetPixelFormatType(buffer)
+
+        switch (pixelBufferFormat) {
+        case kCVPixelFormatType_32BGRA:
+            vImageConvert_BGRA8888toRGB888(&sourceBuffer, &destinationBuffer, UInt32(kvImageNoFlags))
+        case kCVPixelFormatType_32ARGB:
+            vImageConvert_ARGB8888toRGB888(&sourceBuffer, &destinationBuffer, UInt32(kvImageNoFlags))
+        case kCVPixelFormatType_32RGBA:
+            vImageConvert_RGBA8888toRGB888(&sourceBuffer, &destinationBuffer, UInt32(kvImageNoFlags))
+        default:
+            // Unknown pixel format.
+            return nil
+        }
+
+        let byteData = Data(bytes: destinationBuffer.data, count: destinationBuffer.rowBytes * height)
+        if isModelQuantized {
+            return byteData
+        }
+
+        // Not quantized, convert to floats
+        let bytes = Array<UInt8>(unsafeData: byteData)!
+        var floats = [Float]()
+        for i in 0..<bytes.count {
+            floats.append(Float(bytes[i]) / 255.0)
+        }
+        return Data(copyingBufferOf: floats)
       }
+}
 
-      CVPixelBufferLockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
-      let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer!)
 
-      let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-      let context = CGContext(data: pixelData, width: Int(image.size.width), height: Int(image.size.height), bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer!), space: rgbColorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
-
-      context?.translateBy(x: 0, y: image.size.height)
-      context?.scaleBy(x: 1.0, y: -1.0)
-
-      UIGraphicsPushContext(context!)
-      image.draw(in: CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height))
-      UIGraphicsPopContext()
-      CVPixelBufferUnlockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
-
-      return pixelBuffer
+extension UIImage {
+        
+    func convertToBuffer() -> CVPixelBuffer? {
+        
+        let attributes = [
+            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue
+        ] as CFDictionary
+        
+        var pixelBuffer: CVPixelBuffer?
+        
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault, Int(self.size.width),
+            Int(self.size.height),
+            kCVPixelFormatType_32ARGB,
+            attributes,
+            &pixelBuffer)
+        
+        guard (status == kCVReturnSuccess) else {
+            return nil
+        }
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+        
+        let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer!)
+        let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+        
+        let context = CGContext(
+            data: pixelData,
+            width: Int(self.size.width),
+            height: Int(self.size.height),
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer!),
+            space: rgbColorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+        
+        context?.translateBy(x: 0, y: self.size.height)
+        context?.scaleBy(x: 1.0, y: -1.0)
+        
+        UIGraphicsPushContext(context!)
+        self.draw(in: CGRect(x: 0, y: 0, width: self.size.width, height: self.size.height))
+        UIGraphicsPopContext()
+        
+        CVPixelBufferUnlockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+        
+        return pixelBuffer
     }
-    
-    
     
 }
 
 
+extension Data {
+  /// Creates a new buffer by copying the buffer pointer of the given array.
+  ///
+  /// - Warning: The given array's element type `T` must be trivial in that it can be copied bit
+  ///     for bit with no indirection or reference-counting operations; otherwise, reinterpreting
+  ///     data from the resulting buffer has undefined behavior.
+  /// - Parameter array: An array with elements of type `T`.
+  init<T>(copyingBufferOf array: [T]) {
+    self = array.withUnsafeBufferPointer(Data.init)
+  }
+}
+
+extension Array {
+  /// Creates a new array from the bytes of the given unsafe data.
+  ///
+  /// - Warning: The array's `Element` type must be trivial in that it can be copied bit for bit
+  ///     with no indirection or reference-counting operations; otherwise, copying the raw bytes in
+  ///     the `unsafeData`'s buffer to a new array returns an unsafe copy.
+  /// - Note: Returns `nil` if `unsafeData.count` is not a multiple of
+  ///     `MemoryLayout<Element>.stride`.
+  /// - Parameter unsafeData: The data containing the bytes to turn into an array.
+  init?(unsafeData: Data) {
+    guard unsafeData.count % MemoryLayout<Element>.stride == 0 else { return nil }
+    #if swift(>=5.0)
+    self = unsafeData.withUnsafeBytes { .init($0.bindMemory(to: Element.self)) }
+    #else
+    self = unsafeData.withUnsafeBytes {
+      .init(UnsafeBufferPointer<Element>(
+        start: $0,
+        count: unsafeData.count / MemoryLayout<Element>.stride
+      ))
+    }
+    #endif  // swift(>=5.0)
+  }
+}
