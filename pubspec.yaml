@@ -1,6 +1,6 @@
 name: ml_custom
 description: A plugin which can download custom ml model from firebase and run tflite model on image.
-version: 0.0.2
+version: 0.0.2+1
 homepage: https://github.com/supratikkoley/ml_custom
 
 environment:
